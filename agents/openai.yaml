@@ -1,0 +1,4 @@
+interface:
+  display_name: "Image-first PowerPoint"
+  short_description: "图片定稿后重建可编辑文字、独立图层和相近版式"
+  default_prompt: "用 $image-first-ppt 先做逐页设计图，再用原图裁图和可编辑中文文字重建 PPT，最后对照原图检查漏件和变形。"
