@@ -106,6 +106,19 @@ def check_object(element, matching, presentation, width, height, index):
                     not styles or any(str(style[key]).casefold() != str(element[key]).casefold() for style in styles)
                 ):
                     issues.append(f"PPT text style for {key} differs from the manifest.")
+            points_per_pixel = presentation.slide_width / (width * 12700)
+            if "font_px" in element:
+                expected_points = max(1, min(4000, element["font_px"] * points_per_pixel))
+                if not styles or any(style["font_pt"] is None or
+                                     abs(style["font_pt"] - expected_points) > 0.02 for style in styles):
+                    issues.append("PPT text size differs from the manifest.")
+            if "line_height_px" in element:
+                expected_points = element["line_height_px"] * points_per_pixel
+                for paragraph in shape.text_frame.paragraphs:
+                    spacing = paragraph.line_spacing
+                    if not hasattr(spacing, "pt") or abs(spacing.pt - expected_points) > 0.02:
+                        issues.append("PPT text line height differs from the manifest's fixed spacing.")
+                        break
 
     bounds = shape_bounds(shape, presentation.slide_width, presentation.slide_height, width, height)
     if bounds is None:
@@ -150,10 +163,14 @@ def check_slide(presentation, index, slide):
         report["issues"].append("PPT includes shapes without manifest IDs.")
 
     backgrounds = by_name.get(BACKGROUND_NAME, [])
-    if len(backgrounds) > 1:
+    if not backgrounds:
+        report["issues"].append("The reconstructed background object is missing.")
+    elif len(backgrounds) > 1:
         report["issues"].append("PPT has more than one background object.")
     elif backgrounds:
         background = backgrounds[0]
+        if background.shape_type != MSO_SHAPE_TYPE.PICTURE:
+            report["issues"].append("The reconstructed background is not an embedded picture.")
         expected = [0, 0, width, height]
         actual = shape_bounds(background, presentation.slide_width, presentation.slide_height, width, height)
         if not actual or max(abs(a - b) for a, b in zip(actual, expected)) > STRUCTURE_TOLERANCE_PX:

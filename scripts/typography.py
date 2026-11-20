@@ -12,7 +12,7 @@ from PIL import Image, ImageFont
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.oxml.xmlchemy import OxmlElement
-from pptx.util import Pt
+from pptx.util import Emu, Pt
 
 
 EAST_ASIAN = re.compile(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff\uff00-\uffef\U00020000-\U000323af]")
@@ -139,7 +139,7 @@ def add_text(slide, item, box, scale, source, textless):
         paragraph = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
         paragraph.alignment = alignment[item.get("align", "left")]
         paragraph.space_before = paragraph.space_after = Pt(0)
-        paragraph.line_spacing = round(item["line_height_px"] * scale) if "line_height_px" in item else 1.0
+        paragraph.line_spacing = Emu(round(item["line_height_px"] * scale)) if "line_height_px" in item else 1.0
         if line:
             run = paragraph.add_run()
             run.text = line

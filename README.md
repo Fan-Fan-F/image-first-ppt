@@ -22,6 +22,14 @@
 
 [下载可编辑 PowerPoint 样页](examples/demo.pptx) · [打开完整对比图](examples/before-after.png)
 
+## 重叠图案也能完整拖开
+
+v1.1 将下层图案的可见像素和被挡住的部分分开处理。左边的蓝卡按完整轮廓补齐，右边的绿色图案使用完整透明原件，保留中间镂空。对比图的右半是移开两块前层图案后，由桌面 PowerPoint 导出的结果。
+
+![原位叠放和移开前层后的 PowerPoint 渲染](examples/overlap-before-after.png)
+
+[下载重叠样页，试着拖走橙色和紫色前层](examples/overlap.pptx) · [查看完整图层的清单和验收方法](references/completing-layers.md)
+
 ## 重建和检查
 
 - 锁定原图尺寸和坐标，搭配带像素标尺的重叠裁片寻找小图标、细线和脚注。
@@ -31,3 +39,5 @@
 本地脚本通过 Python 3.10 或更新版本运行，[依赖清单](requirements.txt)列出了所需库，无需模型 API。桌面 PowerPoint 渲染已在 Windows 上验证。其它环境可以做结构检查，也可以提供同尺寸的渲染图进行比较。原图中被遮挡的部分需要原素材才能准确恢复。截图里的复杂图表按图片保留，原生图表需原始数据。
 
 [技能说明](SKILL.md) · [清单、命令和校验](references/scene.md) · [相关项目](references/research.md) · [版本记录](CHANGELOG.md) · [MIT 许可证](LICENSE)
+
+运行回归测试可用 `python tests/test_overlapping_layers.py`。

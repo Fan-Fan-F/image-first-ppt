@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -79,14 +80,68 @@ def choice(obj, key, options, label):
         raise ValueError(f"{label}: unknown {key}: {obj[key]}")
 
 
+def check_color(obj, key, label):
+    if key in obj and (not isinstance(obj[key], str) or not HEX.fullmatch(obj[key])):
+        raise ValueError(f"{label}: {key} must be #RRGGBB")
+
+
+def check_completion(item, root, label):
+    choice(item, "occlusion", ("none",), label)
+    if "completion" not in item:
+        return
+    completion = item["completion"]
+    label += "/completion"
+    if not isinstance(completion, dict) or completion.get("mode") not in ("rgba", "solid"):
+        raise ValueError(f"{label}: expected a completion object with mode rgba or solid")
+    if completion["mode"] == "rgba":
+        unsupported = completion.keys() - {"mode", "file", "origin", "visible", "mask"}
+        if unsupported:
+            raise ValueError(f"{label}: unsupported rgba fields: {', '.join(sorted(unsupported))}")
+        if completion.get("origin") not in ("original", "reconstructed"):
+            raise ValueError(f"{label}: rgba origin must be original or reconstructed")
+        choice(completion, "visible", ("source", "asset"), label)
+        source_path(root, completion.get("file"))
+        if "mask" in completion:
+            source_path(root, completion["mask"])
+        return
+
+    unsupported = completion.keys() - {"mode", "geometry", "mask", "polygon", "color", "radius_px"}
+    if unsupported:
+        raise ValueError(f"{label}: unsupported solid fields: {', '.join(sorted(unsupported))}")
+    silhouette = completion.keys() & {"geometry", "mask", "polygon"}
+    if len(silhouette) != 1:
+        raise ValueError(f"{label}: solid completion requires exactly one of geometry, mask, or polygon")
+    choice(completion, "geometry", tuple(SHAPES), label)
+    check_color(completion, "color", label)
+    box = item["box"]
+    if "mask" in completion:
+        source_path(root, completion["mask"])
+    if "polygon" in completion:
+        check_polygon(completion["polygon"], box, f"{label}/polygon")
+    if "radius_px" in completion:
+        if completion.get("geometry") != "round_rect":
+            raise ValueError(f"{label}: radius_px is only available for round_rect")
+        number(completion["radius_px"], 0, min(box[2:]) / 2, f"{label}/radius_px")
+
+
+def matching_aspect(width, height, reference, label):
+    base_width, base_height = reference
+    if width * base_height != height * base_width:
+        raise ValueError(f"{label}: mixed aspect ratios. Pad or crop all sources to the intended ratio before init.")
+
+
 def load_scene(path):
     scene = json.loads(path.read_text(encoding="utf-8-sig"))
-    if scene.get("version") != 1 or not isinstance(scene.get("slides"), list) or not scene["slides"]:
+    if (not isinstance(scene, dict) or type(scene.get("version")) is not int or scene["version"] != 1
+            or not isinstance(scene.get("slides"), list) or not scene["slides"]):
         raise ValueError("expected a version 1 manifest with one or more slides")
     number(scene.get("slide_width_in", 13.33333333), 2, 56, "slide_width_in")
     known = set()
     sources = []
-    for slide in scene["slides"]:
+    reference = None
+    for index, slide in enumerate(scene["slides"], 1):
+        if not isinstance(slide, dict):
+            raise ValueError(f"slide {index}: expected an object")
         slide_id = slide.get("id")
         check_id(slide_id, known, "slide")
         file = source_path(path.parent, slide.get("source"))
@@ -99,11 +154,16 @@ def load_scene(path):
             width, height = raw.size
         if (width, height) != (slide.get("width"), slide.get("height")):
             raise ValueError(f"{slide_id}: manifest dimensions do not match frozen source")
+        if reference is None:
+            reference = width, height
+        matching_aspect(width, height, reference, slide_id)
         elements = slide.get("elements")
         if not isinstance(elements, list) or not elements:
             raise ValueError(f"{slide_id}: element inventory is empty")
         item_ids = set()
-        for item in elements:
+        for index, item in enumerate(elements, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"{slide_id}/element {index}: expected an object")
             item_id = item.get("id")
             check_id(item_id, item_ids, slide_id)
             label = f"{slide_id}/{item_id}"
@@ -113,8 +173,11 @@ def load_scene(path):
             box = item.get("box")
             check_box(box, width, height, label)
             for key in ("color", "erase_fill", "underlay_fill", "fill", "stroke"):
-                if key in item and (not isinstance(item[key], str) or not HEX.fullmatch(item[key])):
-                    raise ValueError(f"{label}: {key} must be #RRGGBB")
+                check_color(item, key, label)
+            if kind == "image":
+                check_completion(item, path.parent, label)
+            elif "completion" in item or "occlusion" in item:
+                raise ValueError(f"{label}: completion and occlusion are only available for image elements")
             if kind == "text":
                 if not isinstance(item.get("text"), str) or not item["text"].strip():
                     raise ValueError(f"{label}: editable text is empty")
@@ -150,12 +213,14 @@ def load_scene(path):
                     check_polygon(item["polygon"], box, f"{label}/polygon")
                 if "mask" in item:
                     source_path(path.parent, item["mask"])
+                    if "polygon" in item:
+                        raise ValueError(f"{label}: choose mask or polygon")
                 if "underlay_patch" in item:
                     source_path(path.parent, item["underlay_patch"])
                     if "underlay_fill" in item:
                         raise ValueError(f"{label}: choose underlay_patch or underlay_fill")
                 if kind == "shape":
-                    if item.get("shape") not in SHAPES or "fill" not in item:
+                    if item.get("shape") not in tuple(SHAPES) or "fill" not in item:
                         raise ValueError(f"{label}: native shape requires supported shape and fill")
                     if "stroke_px" in item:
                         number(item["stroke_px"], 0.05, 2048, f"{label}/stroke_px")
@@ -194,30 +259,63 @@ def write_json(path, value):
 
 def initialize(job_dir, inputs, slide_width):
     number(slide_width, 2, 56, "slide width")
+    if not inputs:
+        raise ValueError("provide at least one source image")
     job_dir.mkdir(parents=True, exist_ok=True)
     manifest = job_dir / "manifest.json"
     if manifest.exists():
         raise ValueError(f"manifest already exists: {manifest}")
-    slides = []
-    for i, path in enumerate(inputs, 1):
-        slide_id = f"s{i:03}"
-        target = job_dir / f"{slide_id}.png"
+    sources = [job_dir / f"s{i:03}.png" for i in range(1, len(inputs) + 1)]
+    for target in sources:
         if target.exists():
             raise ValueError(f"refusing to overwrite frozen source: {target}")
-        with Image.open(path) as raw:
-            source = ImageOps.exif_transpose(raw).convert("RGBA")
-        plate = Image.new("RGBA", source.size, "white")
-        plate.alpha_composite(source)
-        plate.convert("RGB").save(target, format="PNG")
-        slides.append({"id": slide_id, "source": target.name, "width": source.width,
-                       "height": source.height, "sha256": digest(target), "elements": []})
-    write_json(manifest, {"version": 1, "slide_width_in": slide_width, "slides": slides})
+
+    with tempfile.TemporaryDirectory(prefix=".ppt-init-", dir=job_dir) as staged_dir:
+        staging = Path(staged_dir)
+        slides = []
+        reference = None
+        for path, target in zip(inputs, sources):
+            with Image.open(path) as raw:
+                source = ImageOps.exif_transpose(raw).convert("RGBA")
+            if reference is None:
+                reference = source.size
+            matching_aspect(*source.size, reference, path)
+            plate = Image.new("RGBA", source.size, "white")
+            plate.alpha_composite(source)
+            frozen = staging / target.name
+            plate.convert("RGB").save(frozen, format="PNG")
+            slides.append({"id": target.stem, "source": target.name, "width": source.width,
+                           "height": source.height, "sha256": digest(frozen), "elements": []})
+        write_json(staging / manifest.name, {"version": 1, "slide_width_in": slide_width, "slides": slides})
+
+        # Publish the manifest last. Exclusive writes avoid overwriting another
+        # process or user file, and a failed publication removes only its own files.
+        created = []
+        published = False
+        try:
+            for target in [*sources, manifest]:
+                with (staging / target.name).open("rb") as frozen, target.open("xb") as output:
+                    created.append(target)
+                    shutil.copyfileobj(frozen, output)
+            published = True
+        finally:
+            if not published:
+                for target in reversed(created):
+                    target.unlink(missing_ok=True)
     return manifest
 
 
-def build(manifest, output, layers_dir=None):
+def build(manifest, output, layers_dir=None, *, require_complete=False):
     manifest = manifest.resolve()
     scene, sources = load_scene(manifest)
+    if layers_dir:
+        slide_ids = [slide["id"].casefold() for slide in scene["slides"]]
+        if len(set(slide_ids)) != len(slide_ids):
+            raise ValueError("slide IDs that differ only by case conflict in the layer-preview directory")
+        for data in scene["slides"]:
+            image_ids = [item["id"].casefold() for item in data["elements"] if item["kind"] == "image"]
+            if len(set(image_ids)) != len(image_ids):
+                raise ValueError(f"{data['id']}: image IDs that differ only by case conflict in the layer-preview directory")
     first = scene["slides"][0]
     width, height = first["width"], first["height"]
     deck = Presentation()
@@ -234,6 +332,9 @@ def build(manifest, output, layers_dir=None):
         scale = deck.slide_width / source.width
         slide = deck.slides.add_slide(deck.slide_layouts[6])
         background, rasters, raster_stats, textless = prepare(data, source, manifest.parent)
+        unresolved = raster_stats.get("unresolved_images", [])
+        if require_complete and unresolved:
+            raise ValueError(f"{data['id']}: incomplete images: {', '.join(unresolved)}. Supply complete artwork or a supported completion.")
         raster_by_id = {item["id"]: image for item, image in rasters}
         if layers_dir:
             layer_folder = layers_dir / data["id"]
@@ -281,6 +382,7 @@ def main():
     build_parser.add_argument("manifest", type=Path)
     build_parser.add_argument("output", type=Path)
     build_parser.add_argument("--layers-dir", type=Path, help="write optional source-pixel asset previews")
+    build_parser.add_argument("--require-complete", action="store_true", help="refuse unresolved image occlusions")
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -288,7 +390,7 @@ def main():
         else:
             if args.output.suffix.lower() != ".pptx":
                 raise ValueError("output filename must end in .pptx")
-            print(build(args.manifest, args.output, args.layers_dir))
+            print(build(args.manifest, args.output, args.layers_dir, require_complete=args.require_complete))
     except (ValueError, OSError, KeyError) as exc:
         print(f"Reconstruction stopped: {exc}", file=sys.stderr)
         return 1

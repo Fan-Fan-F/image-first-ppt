@@ -45,38 +45,116 @@ def _load_patch(root, filename, region):
         return np.array(image.convert("RGB"))
 
 
-def _element_mask(element, canvas_size, root, *, text=False):
-    box = element.get("erase", element["box"]) if text else element["box"]
+def _region_mask(box, canvas_size, root, *, polygon=None, mask_file=None, geometry=None, radius=None):
     region = _bounds(box, canvas_size)
     left, top, width, height = box
-    polygon = element.get("erase_polygon" if text else "polygon")
-    mask_file = element.get("erase_mask" if text else "mask")
-    shape = element.get("shape") if element["kind"] == "shape" else None
     if mask_file:
         if polygon:
-            raise ValueError(f"use either a mask PNG or a polygon for {element['id']}")
+            raise ValueError("use either a mask PNG or a polygon")
         full = _load_mask(root, mask_file, canvas_size)
         mask = full[region]
         if np.count_nonzero(full) != np.count_nonzero(mask):
-            raise ValueError(f"mask exceeds the declared box for {element['id']}")
-    elif polygon or shape in {"ellipse", "round_rect", "triangle"}:
+            raise ValueError(f"mask exceeds the declared box: {mask_file}")
+    elif polygon or geometry in {"ellipse", "round_rect", "triangle"}:
         raster = Image.new("1", (width, height))
         draw = ImageDraw.Draw(raster)
         outline = (0, 0, width - 1, height - 1)
         if polygon:
             draw.polygon([(x - left, y - top) for x, y in polygon], fill=1)
-        elif shape == "ellipse":
+        elif geometry == "ellipse":
             draw.ellipse(outline, fill=1)
-        elif shape == "round_rect":
-            draw.rounded_rectangle(outline, radius=round(min(width, height) / 6), fill=1)
+        elif geometry == "round_rect":
+            draw.rounded_rectangle(outline, radius=radius if radius is not None else round(min(width, height) / 6), fill=1)
         else:
             draw.polygon([((width - 1) / 2, 0), (width - 1, height - 1), (0, height - 1)], fill=1)
         mask = np.asarray(raster, dtype=bool)
     else:
         mask = np.ones((height, width), dtype=bool)
     if not np.any(mask):
-        raise ValueError(f"empty source mask for {element['id']}")
+        raise ValueError("empty mask")
     return region, mask
+
+
+def _element_mask(element, canvas_size, root, *, text=False):
+    box = element.get("erase", element["box"]) if text else element["box"]
+    try:
+        return _region_mask(
+            box, canvas_size, root, polygon=element.get("erase_polygon" if text else "polygon"),
+            mask_file=element.get("erase_mask" if text else "mask"),
+            geometry=element.get("shape") if element["kind"] == "shape" else None,
+        )
+    except ValueError as error:
+        raise ValueError(f"{element['id']}: {error}") from error
+
+
+def _rgba_candidate(root, filename, size):
+    with Image.open(_local_path(root, filename)) as image:
+        if image.format != "PNG" or image.size != size or image.getexif().get(274, 1) != 1:
+            raise ValueError(f"complete artwork must be an oriented PNG of exactly {size}: {filename}")
+        return np.array(image.convert("RGBA"))
+
+
+def _solid_candidate(element, source, owned, canvas_size, root):
+    completion = element["completion"]
+    box = element["box"]
+    _, silhouette = _region_mask(
+        box, canvas_size, root, polygon=completion.get("polygon"), mask_file=completion.get("mask"),
+        geometry=completion.get("geometry"), radius=completion.get("radius_px"),
+    )
+    pixels = source[owned]
+    if len(pixels) < 16:
+        raise ValueError("a solid completion needs at least 16 visible pixels as color evidence")
+    color = completion.get("color")
+    rgb = np.array(ImageColor.getrgb(color)) if color else np.rint(np.median(pixels, axis=0)).astype(np.uint8)
+    distance = np.max(np.abs(pixels.astype(np.int16) - rgb.astype(np.int16)), axis=1)
+    if (distance <= 10).mean() < 0.95:
+        raise ValueError("visible pixels do not support a solid fill; supply a registered complete PNG")
+    candidate = np.empty((*silhouette.shape, 4), dtype=np.uint8)
+    candidate[..., :3] = rgb
+    candidate[..., 3] = silhouette.astype(np.uint8) * 255
+    return candidate
+
+
+def _complete_asset(element, source, owned, mask, higher, occlusion_suspected, canvas_size, root):
+    completion = element["completion"]
+    mode = completion["mode"]
+    visible = completion.get("visible", "source")
+    if mode == "rgba":
+        candidate = _rgba_candidate(root, completion["file"], (owned.shape[1], owned.shape[0]))
+        origin = completion["origin"]
+    else:
+        candidate = _solid_candidate(element, source, owned, canvas_size, root)
+        origin = "solid_geometry"
+    support = candidate[..., 3] > 0
+    if mode == "rgba" and "mask" in completion:
+        _, silhouette = _region_mask(element["box"], canvas_size, root, mask_file=completion["mask"])
+        missing_silhouette = int((silhouette & ~support).sum())
+        extra_silhouette = int((support & ~silhouette).sum())
+        if missing_silhouette or extra_silhouette:
+            raise ValueError(f"complete PNG disagrees with its independent silhouette: "
+                             f"{missing_silhouette} missing pixels, {extra_silhouette} extra")
+    missing_source = int((owned & ~support).sum())
+    if missing_source:
+        raise ValueError(f"complete asset omits {missing_source} visible source pixels; align its alpha with the source mask")
+    unexpected = int((support & ~owned & ~higher).sum())
+    if unexpected:
+        raise ValueError(f"complete asset adds {unexpected} visible pixels outside the source footprint; refine the source mask or align the asset")
+    # A declaration drawn as the full silhouette explicitly identifies more
+    # occluded pixels. A candidate still has to cover them behind the occluder.
+    missing_hidden = int((mask & higher & ~support).sum())
+    if missing_hidden:
+        raise ValueError(f"complete asset omits {missing_hidden} declared hidden pixels; use a visible-only source mask if those pixels are outside this object")
+    hidden = int((support & higher).sum())
+    if hidden == 0 and occlusion_suspected:
+        raise ValueError("the completed image contains no pixels behind a suspected occluder; review the full silhouette and layer order")
+    if visible == "source":
+        candidate[owned, :3] = source[owned]
+        candidate[owned, 3] = 255
+    candidate[~support] = 0
+    return candidate, {
+        "status": "completed", "mode": mode, "origin": origin, "visible_pixels_from": visible,
+        "restored_hidden_pixels": hidden, "complete_alpha_pixels": int(support.sum()),
+    }
 
 
 def _context(region, image_size, padding):
@@ -171,9 +249,9 @@ def _clear_text(elements, source, canvas_size, root):
 def prepare(slide, source, root):
     """Return repaired plate, movable artwork, stats, and text-cleared source.
 
-    Element array order is back-to-front. A source pixel in overlapping masks
-    belongs to the highest visual element. Hidden artwork cannot be recovered
-    from the flattened source. Underlays are local estimates unless supplied.
+    Element array order is back-to-front. Visible ownership explains the
+    flattened source. A completed asset can independently extend behind its
+    occluders, and its completed support must never expand the background cut.
     """
     root = Path(root).resolve()
     original = np.asarray(source.convert("RGB"))
@@ -186,24 +264,50 @@ def prepare(slide, source, root):
         if element["kind"] not in {"image", "shape"}:
             continue
         region, mask = _element_mask(element, canvas_size, root)
-        owned = mask & ~visual_mask[region]
+        higher = visual_mask[region].copy()
+        owned = mask & ~higher
         visual_mask[region] |= mask
-        entries.append((element, region, mask, owned))
+        entries.append((element, region, mask, owned, higher))
 
     assets = []
     records = {}
+    unresolved = []
     pending = np.zeros_like(visual_mask)
-    for element, region, mask, owned in reversed(entries):
+    for element, region, mask, owned, higher in reversed(entries):
         count = int(owned.sum())
         overlap = int(mask.sum()) - count
-        if count and element["kind"] == "image":
-            # The visible RGB values remain unchanged. Do not multiply color by
-            # the matte or derive a silhouette from a generated reference.
-            rgba = np.empty((*mask.shape, 4), dtype=np.uint8)
-            rgba[..., :3] = cleaned[region]
-            rgba[..., 3] = owned.astype(np.uint8) * 255
-            rgba[~owned] = 0
+        layer_completion = None
+        declaration = element.get("completion", {})
+        known_original = declaration.get("mode") == "rgba" and declaration.get("origin") == "original"
+        if element["kind"] == "image" and (count or known_original):
+            # A visible-only mask can stop right at the occluder, leaving zero
+            # literal intersection. Nearby upper pixels inside the image box
+            # then warrant review without inventing an extent.
+            margin = cv2.dilate(owned.astype(np.uint8), np.ones((5, 5), dtype=np.uint8))
+            touches_higher = bool(np.any(higher & margin.astype(bool)))
+            occlusion_suspected = bool(overlap) or (touches_higher and element.get("occlusion") != "none")
+            if "completion" in element:
+                try:
+                    rgba, layer_completion = _complete_asset(element, cleaned[region], owned, mask, higher, occlusion_suspected,
+                                                             canvas_size, root)
+                except ValueError as error:
+                    raise ValueError(f"{element['id']}: {error}") from error
+            else:
+                rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+                rgba[owned, :3] = cleaned[region][owned]
+                rgba[owned, 3] = 255
+                status = "visible_only"
+                if overlap:
+                    status = "incomplete_overlap"
+                elif occlusion_suspected:
+                    status = "possible_overlap"
+                if status != "visible_only":
+                    unresolved.append(element["id"])
+                layer_completion = {"status": status, "restored_hidden_pixels": 0,
+                                    "complete_alpha_pixels": count, "touches_higher": touches_higher}
             assets.append((element, Image.fromarray(rgba)))
+        elif element["kind"] == "shape":
+            layer_completion = {"status": "native_geometry"}
 
         fill = element.get("underlay_fill")
         patch = element.get("underlay_patch")
@@ -227,6 +331,7 @@ def prepare(slide, source, root):
             "kind": element["kind"], "visible_pixels": count, "occluded_pixels": overlap,
             "overlapping_text_mask_pixels": int((text_mask[region] & owned).sum()),
             "underlay_method": method,
+            "completion": layer_completion,
         }
 
     _inpaint(background, pending)
@@ -237,6 +342,7 @@ def prepare(slide, source, root):
         "visual_mask_pixels": int(visual_mask.sum()),
         "text": text_records,
         "visuals": records,
+        "unresolved_images": unresolved,
         "changed_background_pixels": int(difference.sum()),
         "changed_outside_masks": int((difference & ~edit_mask).sum()),
     }
