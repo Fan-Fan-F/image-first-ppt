@@ -4,20 +4,28 @@
 import argparse
 import base64
 import hashlib
+from io import BytesIO
 import json
+from math import isclose, isfinite
 import os
 from pathlib import Path
+from posixpath import join, normpath
+import re
 import shutil
 import subprocess
 import tempfile
 import unicodedata
+import xml.etree.ElementTree as ET
+from zipfile import BadZipFile, ZipFile
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from pptx import Presentation
+from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
 from pptx.enum.dml import MSO_COLOR_TYPE
 from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.opc.constants import CONTENT_TYPE
 from pptx.oxml.ns import qn
 
 
@@ -25,7 +33,7 @@ BACKGROUND_NAME = "__background__"
 PIXEL_DELTA_THRESHOLD = 24
 STRUCTURE_TOLERANCE_PX = 2.0
 ROTATION_TOLERANCE_DEGREES = 0.25
-OBJECT_OUTLINES = {"text": "#f97316", "image": "#06b6d4", "shape": "#a855f7"}
+OBJECT_OUTLINES = {"text": "#f97316", "image": "#06b6d4", "shape": "#a855f7", "chart": "#1d4ed8"}
 DRAWING_TYPES = {MSO_SHAPE_TYPE.AUTO_SHAPE, MSO_SHAPE_TYPE.FREEFORM, MSO_SHAPE_TYPE.LINE}
 NATIVE_GEOMETRIES = {
     "rect": MSO_SHAPE.RECTANGLE,
@@ -33,6 +41,18 @@ NATIVE_GEOMETRIES = {
     "ellipse": MSO_SHAPE.OVAL,
     "triangle": MSO_SHAPE.ISOSCELES_TRIANGLE,
 }
+NATIVE_CHART_TYPES = {
+    "bar": {XL_CHART_TYPE.BAR_CLUSTERED},
+    "column": {XL_CHART_TYPE.COLUMN_CLUSTERED},
+    "line": {XL_CHART_TYPE.LINE, XL_CHART_TYPE.LINE_MARKERS},
+    "scatter": {XL_CHART_TYPE.XY_SCATTER, XL_CHART_TYPE.XY_SCATTER_LINES, XL_CHART_TYPE.XY_SCATTER_LINES_NO_MARKERS},
+}
+WORKSHEET_XML = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+WORKBOOK_REFERENCE = re.compile(
+    r"(?:'((?:[^']|'')+)'|([^!]+))!\$?([A-Z]{1,3})\$?([1-9][0-9]*)"
+    r"(?::\$?([A-Z]{1,3})\$?([1-9][0-9]*))?\Z",
+    re.IGNORECASE,
+)
 
 
 def normalized_text(value):
@@ -68,6 +88,219 @@ def text_styles(shape):
     return styles
 
 
+def chart_value_matches(actual, expected):
+    if isinstance(expected, str):
+        return isinstance(actual, str) and normalized_text(actual) == normalized_text(expected)
+    # DrawingML and Excel serialize floating point values differently. Keep a
+    # small relative allowance for decimal round-trip, and never round to zero.
+    return (type(actual) in (int, float) and isfinite(actual)
+            and isclose(actual, expected, rel_tol=1e-14, abs_tol=0.0))
+
+
+class ChartWorkbookValues:
+    """Read literal chart-source cells from the actual embedded .xlsx part."""
+
+    def __init__(self, xlsx_bytes):
+        self.sheets = {}
+        with ZipFile(BytesIO(xlsx_bytes)) as archive:
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            rels = list(ET.fromstring(archive.read("xl/_rels/workbook.xml.rels")))
+            targets = {rel.get("Id"): rel for rel in rels if rel.get("TargetMode") != "External"}
+            string_rel = next((rel for rel in targets.values()
+                               if rel.get("Type", "").endswith("/sharedStrings")), None)
+            strings = []
+            if string_rel is not None:
+                table = ET.fromstring(archive.read(self.part_name(string_rel)))
+                strings = [self.rich_text(item) for item in table.findall("s:si", WORKSHEET_XML)]
+            for sheet in workbook.findall("s:sheets/s:sheet", WORKSHEET_XML):
+                sheet_rel = targets[sheet.get(qn("r:id"))]
+                if not sheet_rel.get("Type", "").endswith("/worksheet"):
+                    continue
+                root = ET.fromstring(archive.read(self.part_name(sheet_rel)))
+                cells = root.findall("s:sheetData/s:row/s:c", WORKSHEET_XML)
+                self.sheets[sheet.get("name").casefold()] = {
+                    cell.get("r"): self.cell_value(cell, strings) for cell in cells
+                }
+
+    @staticmethod
+    def part_name(rel):
+        target = rel.get("Target")
+        return normpath(target.lstrip("/") if target.startswith("/") else join("xl", target))
+
+    @staticmethod
+    def rich_text(element):
+        runs = element.findall("s:t", WORKSHEET_XML) + element.findall("s:r/s:t", WORKSHEET_XML)
+        return "".join(run.text or "" for run in runs)
+
+    @classmethod
+    def cell_value(cls, cell, strings):
+        if cell.find("s:f", WORKSHEET_XML) is not None:
+            return None
+        cell_type = cell.get("t", "n")
+        value = cell.findtext("s:v", namespaces=WORKSHEET_XML)
+        if cell_type == "s" and value is not None:
+            index = int(value)
+            return strings[index] if 0 <= index < len(strings) else None
+        if cell_type == "inlineStr":
+            inline = cell.find("s:is", WORKSHEET_XML)
+            return cls.rich_text(inline) if inline is not None else None
+        if cell_type == "str":
+            return value
+        if cell_type == "n" and value is not None:
+            return float(value)
+        return None
+
+    def range_values(self, formula, size):
+        match = WORKBOOK_REFERENCE.fullmatch(formula)
+        if not match:
+            raise ValueError(f"unsupported workbook reference {formula!r}")
+        quoted_sheet, sheet, column, first_row, end_column, end_row = match.groups()
+        cells = self.sheets.get((quoted_sheet.replace("''", "'") if quoted_sheet is not None else sheet).casefold())
+        first = int(first_row)
+        last = int(end_row) if end_row is not None else first
+        if cells is None or (end_column is not None and column.upper() != end_column.upper()) or last - first + 1 != size:
+            raise ValueError(f"workbook reference {formula!r} does not cover the expected column range")
+        return [cells.get(f"{column.upper()}{row}") for row in range(first, last + 1)]
+
+
+def audit_chart_range(series, path, expected, workbook, issues, label, workbook_issues):
+    references = series.xpath(path)
+    if len(references) != 1:
+        issues.append(f"Chart {label} has no single cached, workbook-backed reference.")
+        workbook_issues.append(label)
+        return None
+    reference = references[0]
+    cache_tag = "c:strCache" if isinstance(expected[0], str) else "c:numCache"
+    cache = reference.find(qn(cache_tag))
+    actual = None
+    if cache is not None:
+        count = cache.find(qn("c:ptCount"))
+        points = cache.findall(qn("c:pt"))
+        if count is not None and int(count.get("val")) == len(expected) == len(points):
+            values = {int(point.get("idx")): point.findtext(qn("c:v")) for point in points}
+            if set(values) == set(range(len(expected))) and all(value is not None for value in values.values()):
+                actual = [values[i] for i in range(len(expected))]
+                if cache_tag == "c:numCache":
+                    actual = [float(value) for value in actual]
+                    if not all(isfinite(value) for value in actual):
+                        actual = None
+    if actual is None or not all(chart_value_matches(a, e) for a, e in zip(actual, expected)):
+        issues.append(f"Chart {label} cached data differ from the manifest.")
+
+    formula = reference.findtext(qn("c:f"))
+    if workbook is not None:
+        try:
+            values = workbook.range_values(formula or "", len(expected))
+        except ValueError as error:
+            issues.append(f"Chart {label} has an invalid Excel workbook reference: {error}.")
+            workbook_issues.append(label)
+        else:
+            if not all(chart_value_matches(a, e) for a, e in zip(values, expected)):
+                issues.append(f"Chart {label} Excel workbook data differ from the manifest.")
+                workbook_issues.append(label)
+    return actual
+
+
+def audit_chart_axis(axis, options, issues, description):
+    for key, actual in (
+        ("min", axis.minimum_scale), ("max", axis.maximum_scale), ("major_unit", axis.major_unit),
+        ("number_format", axis.tick_labels.number_format),
+    ):
+        if key in options and not chart_value_matches(actual, options[key]):
+            issues.append(f"Chart {description} {key} differs from the manifest.")
+    for key, actual in (
+        ("visible", axis.visible), ("show_major_gridlines", axis.has_major_gridlines),
+        ("show_tick_labels", axis.tick_label_position != XL_TICK_LABEL_POSITION.NONE),
+    ):
+        if key in options and actual != options[key]:
+            issues.append(f"Chart {description} {key} differs from the manifest.")
+    if "number_format" in options and axis.tick_labels.number_format_is_linked:
+        issues.append(f"Chart {description} unexpectedly uses the workbook's linked number format.")
+    if "title" in options and (
+        not axis.has_title or not chart_value_matches(axis.axis_title.text_frame.text, options["title"])
+    ):
+        issues.append(f"Chart {description} title differs from the manifest.")
+
+
+def check_chart(shape, element, result):
+    issues = result["issues"]
+    result["chart_workbook_status"] = "not_verified"
+    result["chart_source_note"] = element.get("source_note")
+    if not shape.has_chart:
+        issues.append("Expected a native editable PowerPoint chart, not a flattened image or drawing.")
+        return
+    try:
+        chart = shape.chart
+        kind = chart.chart_type
+        result["actual_chart_type"] = kind.name
+        if kind not in NATIVE_CHART_TYPES.get(element["chart_type"], set()) or len(chart.plots) != 1:
+            issues.append("PowerPoint chart type or plot count differs from the manifest.")
+        if "title" in element and (
+            not chart.has_title or not chart_value_matches(chart.chart_title.text_frame.text, element["title"])
+        ):
+            issues.append("Chart title differs from the manifest.")
+        if "source_note" in element:
+            description = shape._element.nvGraphicFramePr.cNvPr.get("descr")
+            if not chart_value_matches(description, element["source_note"]):
+                issues.append("Chart description does not preserve the source note.")
+        if "show_legend" in element and chart.has_legend != element["show_legend"]:
+            issues.append("Chart legend visibility differs from the manifest.")
+        if "data_labels" in element and chart.plots[0].has_data_labels != element["data_labels"]:
+            issues.append("Chart data labels visibility differs from the manifest.")
+
+        workbook = None
+        workbook_issues = []
+        try:
+            part = chart.part.chart_workbook.xlsx_part
+            if part is None or part.content_type != CONTENT_TYPE.SML_SHEET:
+                issues.append("Chart has no embedded editable Excel workbook.")
+            else:
+                workbook = ChartWorkbookValues(part.blob)
+        except (AttributeError, BadZipFile, ET.ParseError, IndexError, KeyError, OSError, TypeError, ValueError):
+            issues.append("Chart embedded editable Excel workbook cannot be read.")
+
+        actual_series = chart.plots[0]._element.findall(qn("c:ser"))
+        expected_series = element["series"]
+        if len(actual_series) != len(expected_series):
+            issues.append("Chart series count differs from the manifest.")
+            workbook_issues.append("series count")
+        is_scatter = element["chart_type"] == "scatter"
+        recorded_series = []
+        for index, (actual, expected) in enumerate(zip(actual_series, expected_series), 1):
+            label = f"series {index}"
+            order = actual.find(qn("c:order"))
+            if order is None or order.get("val") != str(index - 1):
+                issues.append(f"Chart {label} order differs from the manifest.")
+            fields = [
+                ("name", "c:tx/c:strRef", [expected["name"]]),
+                ("values", "c:yVal/c:numRef" if is_scatter else "c:val/c:numRef", expected["values"]),
+                ("x_values", "c:xVal/c:numRef", expected["x_values"]) if is_scatter
+                else ("categories", "c:cat/c:strRef", element["categories"]),
+            ]
+            row = {
+                key: audit_chart_range(actual, path, values, workbook, issues, f"{label} {key}", workbook_issues)
+                for key, path, values in fields
+            }
+            if row["name"] is not None:
+                row["name"] = row["name"][0]
+            recorded_series.append(row)
+        result["actual_chart_series"] = recorded_series
+        result["chart_workbook_status"] = "verified" if workbook is not None and not workbook_issues else "invalid"
+
+        if element.get("value_axis"):
+            audit_chart_axis(chart.value_axis, element["value_axis"], issues, "value axis")
+        if is_scatter and element.get("x_axis"):
+            audit_chart_axis(chart.category_axis, element["x_axis"], issues, "X axis")
+        if "category_axis_title" in element:
+            axis = chart.category_axis
+            if not axis.has_title or not chart_value_matches(
+                axis.axis_title.text_frame.text, element["category_axis_title"]
+            ):
+                issues.append("Chart category axis title differs from the manifest.")
+    except (AttributeError, IndexError, KeyError, NotImplementedError, OverflowError, TypeError, ValueError):
+        issues.append("PowerPoint chart data or formatting cannot be read.")
+
+
 def check_object(element, matching, presentation, width, height, index):
     object_id = element["id"]
     kind = element["kind"]
@@ -90,6 +323,8 @@ def check_object(element, matching, presentation, width, height, index):
         expected_geometry = NATIVE_GEOMETRIES.get(element.get("shape"))
         if expected_geometry is not None and shape.auto_shape_type != expected_geometry:
             issues.append("Native PowerPoint shape geometry differs from the manifest.")
+    if kind == "chart":
+        check_chart(shape, element, result)
     if kind == "text":
         if not shape.has_text_frame:
             issues.append("Expected a native PowerPoint text frame.")
@@ -315,6 +550,7 @@ def compare_render(source, rendered, slide, prefix, output):
     ), axis=2)
     owned_pixels = np.zeros((height, width), dtype=bool)
     text_pixels = np.zeros_like(owned_pixels)
+    chart_pixels = np.zeros_like(owned_pixels)
     regions = []
     review_flags = []
     for number, element in enumerate(slide["elements"], 1):
@@ -323,16 +559,31 @@ def compare_render(source, rendered, slide, prefix, output):
         if element["kind"] == "text":
             text_pixels[y:bottom, x:right] = True
         region_stats = measure(delta[y:bottom, x:right])
-        regions.append({"number": number, "id": element["id"], "stats": region_stats})
+        region = {"number": number, "id": element["id"], "stats": region_stats}
+        regions.append(region)
+        if element["kind"] == "chart":
+            chart_pixels[y:bottom, x:right] = True
+            ex, ey, er, eb = outline_box(element.get("erase", element["box"]), width, height)
+            chart_pixels[ey:eb, ex:er] = True
+            owned_pixels[ey:eb, ex:er] = True
+            region["comparison_role"] = "chart_layout_reference_only"
+            continue
         threshold = 0.15 if element["kind"] == "text" else 0.06
         if region_stats and region_stats["changed_fraction"] > threshold:
             review_flags.append({"region": element["id"], "reason": "Large visual difference inside the source box."})
 
     outside_text = measure(delta[~text_pixels])
+    outside_text_and_charts = measure(delta[~(text_pixels | chart_pixels)])
     outside_objects = measure(delta[~owned_pixels])
     unassigned_changes = localized_changes(delta, ~owned_pixels)
-    if outside_text and outside_text["changed_fraction"] > 0.02:
-        review_flags.append({"region": "outside_text", "reason": "Visual differences extend beyond source text boxes."})
+    if outside_text_and_charts and outside_text_and_charts["changed_fraction"] > 0.02:
+        if chart_pixels.any():
+            review_flags.append({
+                "region": "outside_text_and_charts",
+                "reason": "Visual differences extend beyond source text and native chart boxes.",
+            })
+        else:
+            review_flags.append({"region": "outside_text", "reason": "Visual differences extend beyond source text boxes."})
     if unassigned_changes["count"] or (outside_objects and outside_objects["changed_fraction"] > 0.01):
         review_flags.append({"region": "outside_objects", "reason": "Review visual changes outside inventoried elements."})
 
@@ -358,7 +609,8 @@ def compare_render(source, rendered, slide, prefix, output):
     comparison.save(output / source_render_path)
     return {
         "status": "compared", "overall": measure(delta),
-        "outside_text": outside_text, "outside_objects": outside_objects,
+        "outside_text": outside_text, "outside_text_and_charts": outside_text_and_charts,
+        "outside_objects": outside_objects,
         "objects": regions, "outside_objects_tiles": tiles,
         "outside_objects_components": unassigned_changes, "review_flags": review_flags,
         "difference_image": diff_path, "side_by_side": source_render_path,

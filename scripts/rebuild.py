@@ -18,6 +18,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches
 
+from charts import add_chart, validate_chart
 from raster import prepare
 from typography import add_text
 
@@ -124,6 +125,29 @@ def check_completion(item, root, label):
         number(completion["radius_px"], 0, min(box[2:]) / 2, f"{label}/radius_px")
 
 
+def check_erase(item, root, width, height, label):
+    chart = item["kind"] == "chart"
+    choice(item, "erase_mode", ("none",) if chart else ("auto", "flat", "inpaint", "none"), label)
+    if item.get("erase_mode") == "none":
+        if item.keys() & {"erase", "erase_polygon", "erase_mask", "erase_patch", "erase_fill"}:
+            raise ValueError(f"{label}: erase_mode none is for a clean source without erase fields")
+        return
+    if chart and "erase_patch" not in item and "erase_fill" not in item:
+        raise ValueError(f"{label}: replace the raster chart with erase_fill or erase_patch; use erase_mode none for a clean design")
+    erase = item.get("erase", item["box"])
+    check_box(erase, width, height, f"{label}/erase")
+    if "erase_polygon" in item:
+        check_polygon(item["erase_polygon"], erase, f"{label}/erase_polygon")
+    if "erase_mask" in item:
+        source_path(root, item["erase_mask"])
+        if "erase_polygon" in item:
+            raise ValueError(f"{label}: choose erase_mask or erase_polygon")
+    if "erase_patch" in item:
+        source_path(root, item["erase_patch"])
+        if "erase_fill" in item or not (chart or "erase_mask" in item or "erase_polygon" in item):
+            raise ValueError(f"{label}: erase_patch conflicts with erase_fill and needs a mask for text")
+
+
 def matching_aspect(width, height, reference, label):
     base_width, base_height = reference
     if width * base_height != height * base_width:
@@ -168,7 +192,7 @@ def load_scene(path):
             check_id(item_id, item_ids, slide_id)
             label = f"{slide_id}/{item_id}"
             kind = item.get("kind")
-            if kind not in ("text", "image", "shape"):
+            if kind not in ("text", "image", "shape", "chart"):
                 raise ValueError(f"{label}: unknown kind: {kind!r}")
             box = item.get("box")
             check_box(box, width, height, label)
@@ -178,26 +202,15 @@ def load_scene(path):
                 check_completion(item, path.parent, label)
             elif "completion" in item or "occlusion" in item:
                 raise ValueError(f"{label}: completion and occlusion are only available for image elements")
+            if kind in ("text", "chart"):
+                check_erase(item, path.parent, width, height, label)
             if kind == "text":
                 if not isinstance(item.get("text"), str) or not item["text"].strip():
                     raise ValueError(f"{label}: editable text is empty")
                 if any(ord(c) < 32 and c not in "\n\t" for c in item["text"]):
                     raise ValueError(f"{label}: use LF line breaks and remove control characters")
-                erase = item.get("erase", box)
-                check_box(erase, width, height, f"{label}/erase")
-                if "erase_polygon" in item:
-                    check_polygon(item["erase_polygon"], erase, f"{label}/erase_polygon")
-                if "erase_mask" in item:
-                    source_path(path.parent, item["erase_mask"])
-                    if "erase_polygon" in item:
-                        raise ValueError(f"{label}: choose erase_mask or erase_polygon")
-                if "erase_patch" in item:
-                    source_path(path.parent, item["erase_patch"])
-                    if "erase_fill" in item or not ("erase_mask" in item or "erase_polygon" in item):
-                        raise ValueError(f"{label}: erase_patch requires a tight erase_mask or erase_polygon, without erase_fill")
                 choice(item, "align", ("left", "center", "right"), label)
                 choice(item, "valign", ("top", "middle", "bottom"), label)
-                choice(item, "erase_mode", ("auto", "flat", "inpaint"), label)
                 for key in ("font", "font_ea"):
                     if key in item and (not isinstance(item[key], str) or not item[key].strip()):
                         raise ValueError(f"{label}: {key} must be a font family name")
@@ -208,6 +221,10 @@ def load_scene(path):
                                     "rotation": (-359.999, 359.999)}.items():
                     if key in item:
                         number(item[key], *limits, f"{label}/{key}")
+            elif kind == "chart":
+                validate_chart(item, label)
+                if item.get("rotation", 0):
+                    raise ValueError(f"{label}: native chart rotation is unsupported")
             else:
                 if "polygon" in item:
                     check_polygon(item["polygon"], box, f"{label}/polygon")
@@ -345,6 +362,7 @@ def build(manifest, output, layers_dir=None, *, require_complete=False):
                 raster.save(layer_folder / f"{item_id}.png")
         picture(slide, background, (0, 0, deck.slide_width, deck.slide_height), "__background__")
         typography = {}
+        charts = {}
         for item in data["elements"]:
             box = tuple(round(v * scale) for v in item["box"])
             if item["kind"] == "text":
@@ -353,9 +371,16 @@ def build(manifest, output, layers_dir=None, *, require_complete=False):
                 if item["id"] not in raster_by_id:
                     raise ValueError(f"{data['id']}/{item['id']}: no visible source pixels. Check its box, mask and layer order.")
                 picture(slide, raster_by_id[item["id"]], box, item["id"])
+            elif item["kind"] == "chart":
+                add_chart(slide, item, box, scale)
+                charts[item["id"]] = {
+                    "chart_type": item["chart_type"],
+                    "series_count": len(item["series"]),
+                    "source_note": item["source_note"],
+                }
             else:
                 native_shape(slide, item, box, scale)
-        results.append({"id": data["id"], "raster": raster_stats, "typography": typography})
+        results.append({"id": data["id"], "raster": raster_stats, "typography": typography, "charts": charts})
 
     output.parent.mkdir(parents=True, exist_ok=True)
     file_descriptor, filename = tempfile.mkstemp(suffix=".pptx", dir=output.parent)

@@ -35,9 +35,10 @@ v1.1 将下层图案的可见像素和被挡住的部分分开处理。左边的
 - 锁定原图尺寸和坐标，搭配带像素标尺的重叠裁片寻找小图标、细线和脚注。
 - 从原图像素制作图层，按遮罩局部清除文字或修补底图。可单独采样字色，匹配本机中英文字体和字重。
 - 检查 PPTX 中的元素、坐标和可编辑文字。用真实渲染和差异图复核画面，再检查移动图层后是否露出残影。
+- 从原始表格和权威来源建立数值清单，替换图稿里的柱形图、条形图、折线图和 XY 图。原生图表可以在 PowerPoint 里用「编辑数据」修改，校验脚本会同时核对图表显示的数据和内嵌 Excel 工作簿。[数据审查与原生图表](references/native-charts.md)
 
-本地脚本通过 Python 3.10 或更新版本运行，[依赖清单](requirements.txt)列出了所需库，无需模型 API。桌面 PowerPoint 渲染已在 Windows 上验证。其它环境可以做结构检查，也可以提供同尺寸的渲染图进行比较。原图中被遮挡的部分需要原素材才能准确恢复。截图里的复杂图表按图片保留，原生图表需原始数据。
+本地脚本通过 Python 3.10 或更新版本运行，[依赖清单](requirements.txt)列出了所需库，无需模型 API。桌面 PowerPoint 渲染已在 Windows 上验证。其它环境可以做结构检查，也可以提供同尺寸的渲染图进行比较。准确恢复被遮挡部分需要原素材，原生图表需要经过核对的数据。
 
 [技能说明](SKILL.md) · [清单、命令和校验](references/scene.md) · [相关项目](references/research.md) · [版本记录](CHANGELOG.md) · [MIT 许可证](LICENSE)
 
-运行回归测试可用 `python tests/test_overlapping_layers.py`。
+运行回归测试可用 `python -m unittest discover -s tests`。

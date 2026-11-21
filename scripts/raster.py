@@ -201,20 +201,26 @@ def _inpaint(rgb, mask):
     rgb[outer][pixels] = repaired[pixels]
 
 
-def _clear_text(elements, source, canvas_size, root):
+def _clear_replaced_elements(elements, source, canvas_size, root):
     cleaned = source.copy()
     union = np.zeros(source.shape[:2], dtype=bool)
+    masks = {kind: np.zeros_like(union) for kind in ("text", "chart")}
+    records = {kind: {} for kind in masks}
     pending = union.copy()
     regions = []
     for element in elements:
-        if element["kind"] != "text":
+        kind = element["kind"]
+        if kind not in masks:
+            continue
+        if element.get("erase_mode") == "none":
+            records[kind][element["id"]] = {"method": "clean_source", "pixels": 0}
             continue
         region, mask = _element_mask(element, canvas_size, root, text=True)
         union[region] |= mask
+        masks[kind][region] |= mask
         regions.append((element, region, mask))
 
     claimed = np.zeros_like(union)
-    records = {}
     for element, region, mask in reversed(regions):
         owned = mask & ~claimed[region]
         claimed[region] |= mask
@@ -240,10 +246,10 @@ def _clear_text(elements, source, canvas_size, root):
             else:
                 pending[region] |= owned
                 method = "local_inpaint"
-        records[element["id"]] = {"method": method, "pixels": count}
+        records[element["kind"]][element["id"]] = {"method": method, "pixels": count}
 
     _inpaint(cleaned, pending)
-    return cleaned, union, records
+    return cleaned, union, masks, records
 
 
 def prepare(slide, source, root):
@@ -256,7 +262,10 @@ def prepare(slide, source, root):
     root = Path(root).resolve()
     original = np.asarray(source.convert("RGB"))
     canvas_size = source.size
-    cleaned, text_mask, text_records = _clear_text(slide["elements"], original, canvas_size, root)
+    cleaned, replaced_mask, masks, replacement_records = _clear_replaced_elements(
+        slide["elements"], original, canvas_size, root,
+    )
+    text_mask = masks["text"]
     background = cleaned.copy()
     visual_mask = np.zeros(original.shape[:2], dtype=bool)
     entries = []
@@ -335,12 +344,14 @@ def prepare(slide, source, root):
         }
 
     _inpaint(background, pending)
-    edit_mask = text_mask | visual_mask
+    edit_mask = replaced_mask | visual_mask
     difference = np.any(background != original, axis=2)
     stats = {
         "text_mask_pixels": int(text_mask.sum()),
+        "chart_mask_pixels": int(masks["chart"].sum()),
         "visual_mask_pixels": int(visual_mask.sum()),
-        "text": text_records,
+        "text": replacement_records["text"],
+        "chart": replacement_records["chart"],
         "visuals": records,
         "unresolved_images": unresolved,
         "changed_background_pixels": int(difference.sum()),

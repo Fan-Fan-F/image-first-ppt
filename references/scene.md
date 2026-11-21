@@ -18,12 +18,14 @@
 |---|---|
 | `text` | `text` 为最终文字，实际换行写 JSON 的 `\n`。可用 `font`、`font_ea`、`font_px`、`bold`、`italic`、`color`、`align`（left/center/right）、`valign`（top/middle/bottom）、`rotation`（度，顺时针）、`line_height_px`。局部混合字号或颜色可用多个文字框精确摆放。 |
 | `image` | `box` 是放置范围。可用 `polygon` 或 `mask` 选取原图内的像素。零件中断、孔洞或复杂轮廓优先用二值图。被遮挡的完整对象可用 `completion`，见 [完整图层](completing-layers.md)。 |
+| `chart` | PowerPoint 原生图表。支持 `column`、`bar`、`line`、`scatter`。用审核过的系列数值和来源，清除已有的位图图表。字段和示例见[数据审查与原生图表](native-charts.md)。 |
 | `shape` | `shape` 选 rect、round_rect、ellipse 或 triangle，附明确的 `fill`。可用 `stroke`、`stroke_px`。原图上占据的像素范围也支持 `polygon` 或 `mask`。PPT 默认圆角与原图差异大时改回图片层。 |
 
 ### 文字去除和图形补底
 
 - `erase` 是原始字形所在的 `[x,y,w,h]`，默认等同 `box`，可以独立于新文字框调整。按需要给 `erase_polygon`（顶点都在 `erase` 内）或 `erase_mask`（相对目录下与原图同尺寸的二值 PNG，选中像素都在 `erase` 内）。环绕花纹处把擦除范围收窄成字形，或分多段登记。多色字体、描边和艺术字需仔细核对。
 - `erase_fill` 表示此字下已知底色。省略时 `erase_mode` 默认 auto，根据局部边缘选择平涂或局部补洞，可指定 flat 或 inpaint。补洞只能估计原图中被覆盖的像素，对文字压住复杂纹理的情况必须检查边缘。
+- 确认图稿区域已空白时，文字或图表可设 `erase_mode: "none"`，以保留原来的底色或纹理。
 - `polygon` 的顶点是位于 `box` 内的原图整数像素。 `mask` 是相对清单目录、与原图同宽高的二值 PNG，白像素选中，黑色或全透明像素忽略。使用固定大小的二值图可表达不相连的部件和孔洞。
 - `underlay_fill` 用于已知的图形背后底色。省略会局部估计。重叠处按从底至顶的实际归属分配可见像素，独立图层的遮盖部分由 `completion` 单独补全。透明边缘默认按原稿中已合成的 RGB 保留，移动到不同颜色的底图上可能显示原底色边缘。猜不到的原始细节需要原素材恢复。
 - 局部补图可用 `erase_patch` 或 `underlay_patch` 引用本地 PNG。其尺寸必须与 `erase` 或 `box` 完全相同。去字补图需要窄 `erase_mask` 或 `erase_polygon`，去图补底只采用当前物体可见遮罩范围内的像素。补图和显式填充色二选一。导入后检查边缘是否接上。
